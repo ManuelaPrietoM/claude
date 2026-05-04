@@ -10,6 +10,7 @@ Uso:
 """
 
 import logging
+import os
 import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -23,11 +24,27 @@ log = logging.getLogger(__name__)
 SANTIAGO_TZ = ZoneInfo("America/Santiago")
 
 
+LOG_FILE = os.path.join(os.path.dirname(__file__), "bot.log")
+
+
+def _setup_logging() -> None:
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    # Archivo rotativo: máx 5 MB × 3 archivos
+    from logging.handlers import RotatingFileHandler
+    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3)
+    file_handler.setFormatter(fmt)
+    root.addHandler(file_handler)
+
+
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
+    _setup_logging()
 
     # ── Modo --preview: muestra el mensaje ignorando BOT_ENABLED ──────────────
     if "--preview" in sys.argv:

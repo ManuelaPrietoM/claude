@@ -49,7 +49,13 @@ def fetch_usd_clp() -> dict:
         r.raise_for_status()
         serie = r.json().get("serie", [])
         if serie:
-            return {"valor": serie[0]["valor"], "fecha": serie[0]["fecha"][:10]}
+            fecha = serie[0]["fecha"][:10]
+            hoy   = datetime.now(SANTIAGO_TZ).strftime("%Y-%m-%d")
+            return {
+                "valor":  serie[0]["valor"],
+                "fecha":  fecha,
+                "es_hoy": fecha == hoy,
+            }
         return {"error": "Serie vacía"}
     except Exception as e:
         log.error("Error fetching USD/CLP: %s", e)
@@ -57,27 +63,35 @@ def fetch_usd_clp() -> dict:
 
 
 def fetch_us_market() -> dict:
-    """Cierre anterior de los principales índices de EE.UU. via yfinance."""
+    """
+    Último cierre de los principales índices de EE.UU. via yfinance.
+    Usa period="5d" para garantizar al menos 2 sesiones bursátiles
+    (period="2d" falla los lunes porque sáb/dom no son días de mercado).
+    try/except por ticker para que un fallo individual no bloquee los demás.
+    """
     indices = {
         "S&P 500":   "^GSPC",
         "NASDAQ":    "^IXIC",
         "Dow Jones": "^DJI",
     }
     results = {}
-    try:
-        for name, symbol in indices.items():
-            hist = yf.Ticker(symbol).history(period="2d")
+    for name, symbol in indices.items():
+        try:
+            hist = yf.Ticker(symbol).history(period="5d")
             if len(hist) >= 2:
-                prev = hist["Close"].iloc[-2]
-                curr = hist["Close"].iloc[-1]
-                pct  = ((curr - prev) / prev) * 100
+                prev       = hist["Close"].iloc[-2]
+                curr       = hist["Close"].iloc[-1]
+                pct        = ((curr - prev) / prev) * 100
+                close_date = hist.index[-1].strftime("%d-%b").lower()
                 results[name] = {
                     "value":      round(curr, 2),
                     "change_pct": round(pct, 2),
+                    "date":       close_date,
                 }
-    except Exception as e:
-        log.error("Error fetching market data: %s", e)
-        results["error"] = str(e)
+            else:
+                log.warning("Sin suficientes datos para %s (%d filas)", symbol, len(hist))
+        except Exception as e:
+            log.error("Error fetching %s (%s): %s", name, symbol, e)
     return results
 
 
@@ -206,21 +220,24 @@ def build_message(
 
     # ── Dólar ──
     if "valor" in usd_clp:
-        lines.append(f"💵 *Dólar hoy:* ${usd_clp['valor']:,.0f} CLP")
+        label = "hoy" if usd_clp.get("es_hoy") else f"cierre {usd_clp['fecha']}"
+        lines.append(f"💵 *Dólar ({label}):* ${usd_clp['valor']:,.0f} CLP")
     else:
         lines.append("💵 *Dólar:* No disponible")
     lines.append("")
 
     # ── Bolsa americana ──
-    lines.append("📈 *Bolsa americana (cierre anterior):*")
-    if market and "error" not in market:
+    lines.append("📈 *Bolsa americana (último cierre):*")
+    if market:
         for name, d in market.items():
+            if not isinstance(d, dict) or "value" not in d:
+                continue
             arrow = "▲" if d["change_pct"] >= 0 else "▼"
             sign  = "+" if d["change_pct"] >= 0 else ""
             lines.append(
-                f"  {arrow} {name}: {d['value']:,.2f} ({sign}{d['change_pct']:.2f}%)"
+                f"  {arrow} {name}: {d['value']:,.2f} ({sign}{d['change_pct']:.2f}%) — {d['date']}"
             )
-    else:
+    if not any(isinstance(v, dict) and "value" in v for v in market.values()):
         lines.append("  No disponible")
     lines.append("")
 
@@ -260,20 +277,22 @@ def run() -> None:
         return
 
     log.info("Iniciando bot diario — %s", datetime.now(SANTIAGO_TZ).isoformat())
+    try:
+        usd_clp       = fetch_usd_clp()
+        market        = fetch_us_market()
+        headlines     = fetch_chile_political_headlines()
+        chile_summary = summarize_news_with_claude(headlines)
+        events        = fetch_calendar_events()
 
-    usd_clp       = fetch_usd_clp()
-    market        = fetch_us_market()
-    headlines     = fetch_chile_political_headlines()
-    chile_summary = summarize_news_with_claude(headlines)
-    events        = fetch_calendar_events()
+        message = build_message(usd_clp, market, chile_summary, events)
+        sent    = send_whatsapp(message)
 
-    message = build_message(usd_clp, market, chile_summary, events)
-    sent    = send_whatsapp(message)
-
-    if sent:
-        log.info("✓ Mensaje enviado a +%s", WHATSAPP_TO)
-    else:
-        log.warning("✗ Mensaje no enviado (MCP no conectado)")
+        if sent:
+            log.info("✓ Mensaje enviado a +%s", WHATSAPP_TO)
+        else:
+            log.warning("✗ Mensaje no enviado (MCP no conectado)")
+    except Exception:
+        log.exception("Error crítico en run() — el bot no pudo completar la ejecución")
 
 
 if __name__ == "__main__":
